@@ -8,6 +8,8 @@ from lxml import html as _lh
 
 from .config import SPEC
 from .store import Store
+from .recon import Reconciler
+from . import kernel
 
 
 # --------------------------------------------------------------------------- #
@@ -173,6 +175,36 @@ def _apply_kernel(records):
     return records
 
 
+def _run_id(mode, candidate_hashes, watermark):
+    """Deterministic run id: same inputs -> same id, so resume is idempotent."""
+    blob = json.dumps(
+        {"mode": mode, "hashes": sorted(candidate_hashes), "wm": watermark},
+        sort_keys=True, ensure_ascii=False)
+    return "run-" + hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def _reconcile(store, norm, mode, wm):
+    """Feed the normalized batch into the append-only NAV reconciliation.
+
+    The raw ``records`` table is untouched; this layer is additive.  The
+    reconciler itself dedupes candidate evidence and only appends a new
+    conclusion version when the decision actually changes.
+    """
+    candidates = kernel.build_candidates(norm)
+    run_id = _run_id(mode, [c["candidate_hash"] for c in candidates], wm)
+    store.start_run(run_id, mode, wm or "")
+    rec = Reconciler(store, expected_sources=getattr(SPEC, "expected_sources", ()))
+    evidence_added = rec.ingest_many(candidates)
+    report = rec.reconcile(run_id)
+    store.finish_run(run_id, wm or "", report)
+    store.commit()
+    report["run_id"] = run_id
+    report["evidence_added"] = evidence_added
+    report["valuation_progress"] = rec.valuation_progress()
+    report["suspension_evidence"] = rec.suspension_evidence()
+    return report
+
+
 # --------------------------------------------------------------------------- #
 # Collection pipeline.
 # --------------------------------------------------------------------------- #
@@ -197,10 +229,11 @@ def run(mode="full", con=None):
         new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
         if new_wm:
             store.set_watermark(new_wm)
+        recon_report = _reconcile(store, norm, mode, new_wm)
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
                 "duplicates": dup_in_batch, "ingested": ingested, "count": total,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
-                "watermark": store.watermark()}
+                "watermark": store.watermark(), "nav": recon_report}
     finally:
         if own:
             con.close()
@@ -298,10 +331,12 @@ def run_rpa(con=None):
         wm = max([str(x.get("ts", "")) for x in norm] + [""])
         if wm:
             store.set_watermark(wm)
+        recon_report = _reconcile(store, norm, "full", wm)
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
                 "ingested": ingested, "count": total,
-                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
+                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log,
+                "nav": recon_report}
     finally:
         if own:
             con.close()
